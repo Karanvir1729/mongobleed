@@ -33,6 +33,10 @@ Connect with a Mongo shell (choose one):
     mongosh -u admin -p 'SuperSecret123!' --authenticationDatabase admin --quiet
   Then run the same mongosh commands as above (ping, show dbs, etc.).
 
+2.5) Warm up the memory (IMPORTANT for reliable leak detection)
+- Command: ./warmup.sh
+  Explanation: Queries all sensitive collections (api_keys, internal_users, honey_tokens, etc.) multiple times to ensure secrets are loaded into MongoDB's memory cache. This significantly increases the chance of leaking actual secrets vs. just internal MongoDB strings.
+
 3) Run the memory-leak probe
 - Command: python3 mongobleed.py --host localhost --max-offset 50000 --output leaked.bin
   Explanation: Sends crafted messages to localhost:27017, probing document lengths up to 50,000 bytes. Any leaked fragments are concatenated into leaked.bin. Increase --max-offset for a deeper scan; adjust --host/--port if needed.

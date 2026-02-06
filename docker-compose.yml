@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   mongodb-vulnerable:
     image: mongo:8.2.2
@@ -13,9 +11,18 @@ services:
     volumes:
       - ./init/init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
       - mongodb_data:/data/db
-    command: ["mongod", "--networkMessageCompressors", "zlib", "--bind_ip_all"]
+      # ============================================================
+      # HONEY FILES - File paths appear in /proc/mountinfo and get leaked!
+      # These filenames contain secrets that will be visible in the leak.
+      # ============================================================
+      - ./secrets/API_KEY_sk_live_51HqXXXXXXXXXXXX_STRIPE_SECRET.txt:/etc/secrets/stripe:ro
+      - ./secrets/AWS_SECRET_AKIAIOSFODNN7EXAMPLE_wJalrXUtnFEMI.txt:/etc/secrets/aws:ro
+      - ./secrets/PASSWORD_SuperSecretAdmin123_DB_MASTER.txt:/etc/secrets/dbpass:ro
+      - ./secrets/JWT_SECRET_your-256-bit-secret-key.txt:/etc/secrets/jwt:ro
+      - ./secrets/OPENAI_sk-proj-abcdef123456_API_KEY.txt:/etc/secrets/openai:ro
+      - ./secrets/GITHUB_ghp_xxxxxxxxxxxxxxxxxxxx_TOKEN.txt:/etc/secrets/github:ro
+    command: [ "mongod", "--networkMessageCompressors", "zlib", "--bind_ip_all" ]
     restart: unless-stopped
 
 volumes:
   mongodb_data:
-
