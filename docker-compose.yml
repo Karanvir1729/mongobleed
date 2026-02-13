@@ -11,10 +11,6 @@ services:
     volumes:
       - ./init/init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
       - mongodb_data:/data/db
-      # ============================================================
-      # HONEY FILES - File paths appear in /proc/mountinfo and get leaked!
-      # These filenames contain secrets that will be visible in the leak.
-      # ============================================================
       - ./secrets/API_KEY_sk_live_51HqXXXXXXXXXXXX_STRIPE_SECRET.txt:/etc/secrets/stripe:ro
       - ./secrets/AWS_SECRET_AKIAIOSFODNN7EXAMPLE_wJalrXUtnFEMI.txt:/etc/secrets/aws:ro
       - ./secrets/PASSWORD_SuperSecretAdmin123_DB_MASTER.txt:/etc/secrets/dbpass:ro
